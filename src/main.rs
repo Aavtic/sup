@@ -228,8 +228,7 @@ fn handle(conn: TcpStream, conn_addr: std::net::SocketAddr, messaging_service: S
 
            ClientUpdate::Disconnected(addr) => {
                 _ = conn.shutdown(std::net::Shutdown::Both);
-                let Err(err) = messaging_service.send(Update::Disconnected(addr)) else { continue };
-                println!("ERROR: {}", err);
+                messaging_service.send(Update::Disconnected(addr)).unwrap();
                 return;
             }
         }
