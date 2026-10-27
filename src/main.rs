@@ -1,19 +1,74 @@
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
-use std::io::Write;
-use std::io::Read;
+use std::io::{BufRead, BufReader};
 use std::io::ErrorKind;
+use std::io::Write;
 
+use std::net::{Ipv4Addr, SocketAddrV4, SocketAddr};
 use std::net::{TcpListener, TcpStream};
-use std::net::{SocketAddrV4, Ipv4Addr};
 
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+use serde::{Serialize, Deserialize};
+
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ServerBroadcast {
+    from: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NewMessage {
+    from: String,
+    message: String,
+    connection: SocketAddr,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NewMessageIn {
+    message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NewMessageOut {
+    from: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UserInternal {
+    name: String,
+    connection: SocketAddr,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+enum Update {
+    NewMessage(NewMessage),
+    ServerBroadcast(ServerBroadcast),
+    Disconnected(SocketAddr),
+    NewUser(UserInternal),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct User {
+    name: String,
+}
+#[derive(Debug, Serialize, Deserialize)]
+enum ClientUpdate {
+    NewMessage(NewMessageIn),
+    NewUser(User),
+    Disconnected(SocketAddr),
+}
 
 #[derive(Debug)]
 struct MessagingService {
     connections: Arc<Mutex<Vec<TcpStream>>>,
-    sender: Sender<String>,
-    receiver: Option<std::sync::mpsc::Receiver<String>>,
+    users: Arc<Mutex<HashMap<SocketAddr, User>>>,
+    sender: Sender<Update>,
+    receiver: Option<std::sync::mpsc::Receiver<Update>>,
 }
 
 impl MessagingService {
@@ -21,12 +76,13 @@ impl MessagingService {
         let (sender, receiver) = channel();
         Self {
             connections: Arc::new(Mutex::new(Vec::new())),
+            users: Arc::new(Mutex::new(HashMap::new())),
             sender,
             receiver: Some(receiver),
         }
     }
 
-    fn get_sender(&self) -> Sender<String> {
+    fn get_sender(&self) -> Sender<Update> {
         return self.sender.clone();
     }
 
@@ -34,33 +90,97 @@ impl MessagingService {
         self.connections.lock().unwrap().push(conn);
     }
 
+    fn try_send_to_all_connections(conn: &mut TcpStream, user_name: String, message: String) -> bool {
+        let new_message_out = NewMessageOut { from: user_name.clone(), message: message.clone() };
+
+        let new_message_json = serde_json::to_vec(&new_message_out).unwrap();
+
+        match conn.write_all(&new_message_json) {
+            Ok(_) => true,
+            Err(err) => {
+                match err.kind() {
+                    ErrorKind::BrokenPipe => false,
+                    _ => {
+                        eprintln!("ERROR: Could not send message: {} to connection due to : {}. Closing Connection",message, err);
+                        _ = conn.shutdown(std::net::Shutdown::Both);
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+
     fn start_messaging_service_background(&mut self) {
         let receiver = self.receiver.take().unwrap();
         let connections = Arc::clone(&self.connections);
+        let users    =    Arc::clone(&self.users);
 
         std::thread::spawn(move || {
-            while let Ok(msg) = receiver.recv() {
+            while let Ok(update) = receiver.recv() {
 
-                let mut connections = connections.lock().unwrap();
+                match update {
+                    Update::NewUser(user_internal) => {
+                        println!("[{}] Joined the chat", user_internal.name.clone());
 
-                connections.retain_mut(|conn| {
-                    match conn.write_all(msg.as_bytes()) {
-                        Ok(_) => true,
-                        Err(err) => {
-                            match err.kind() {
-                                ErrorKind::BrokenPipe => false,
-                                _ => {
-                                    eprintln!("ERROR: Could not send message: {} to connection due to : {}. Closing Connection", msg, err);
-                                    _ = conn.shutdown(std::net::Shutdown::Both);
-                                    false
-                                }
-                            }
-                        }
+                        users.lock().unwrap().insert(user_internal.connection, User{ name: user_internal.name });
                     }
-                })
+
+                    Update::NewMessage(new_message) => {
+                        let mut connections = connections.lock().unwrap();
+                        let user_name;
+                        if let Some(user) = users.lock().unwrap().get(&new_message.connection) {
+                            user_name = user.name.clone();
+                        } else {
+                            user_name = "NOTFOUND".into();
+                        }
+
+                        println!("[{}]: {}", user_name, new_message.message);
+
+                        connections.retain_mut(|conn| Self::try_send_to_all_connections(conn, user_name.clone(), new_message.message.clone()));
+                    },
+
+
+                    Update::ServerBroadcast(broadcast) => {
+                        let mut connections = connections.lock().unwrap();
+                        let user_name = broadcast.from;
+
+                        println!("[{}]: {}", user_name, broadcast.message);
+
+                        connections.retain_mut(|conn| Self::try_send_to_all_connections(conn, user_name.clone(), broadcast.message.clone()));
+                    }
+
+                    Update::Disconnected(addr) => {
+                        //
+                        // just needs to be removed from users as elements in the connections list
+                        // is automatically removed once a broadcast message to them fails
+                        //
+
+                        let Some(user) = users.lock().unwrap().remove(&addr) else { continue };
+                        println!("[{}] DISCONNECTED", user.name);
+                    }
+
+                }
             }
+
         });
     }
+}
+
+
+fn get_client_update(reader: &mut BufReader<&TcpStream>, addr: &SocketAddr) -> Result<ClientUpdate, Box<dyn std::error::Error>> {
+    let mut line = String::new();
+
+    let bytes = reader.read_line(&mut line)?;
+
+    // Client disconnected
+    if bytes == 0 {
+        return Ok(ClientUpdate::Disconnected(addr.clone()));
+    }
+
+    let update = serde_json::from_str(&line)?;
+
+    Ok(update)
 }
 
 fn get_user_input() -> String {
@@ -71,68 +191,66 @@ fn get_user_input() -> String {
     std::io::stdout().lock().flush().unwrap();
     std::io::stdin().read_line(&mut input).unwrap();
 
-    return input
+    return input;
 }
 
-fn handle(mut conn: TcpStream, conn_addr: std::net::SocketAddr, broadcast_sender: Sender<String>) {
+
+fn handle(conn: TcpStream, conn_addr: std::net::SocketAddr, messaging_service: Sender<Update>) {
     println!("Connection accepted from: {}", conn_addr.ip().to_string());
 
-    let mut data: [u8; 1024] = [0; 1024];
+    let mut user_created = false;
+    
+    let mut reader = BufReader::new(&conn);
 
     loop {
+        let Ok(update) = get_client_update(&mut reader, &conn_addr) else {
+            println!("UNSUPPORTED MESSAGE RECEIVED");
+            continue
+        };
 
-        match conn.read(&mut data) {
-            Ok(0) => {
-                println!("Client {} disconnected", conn.peer_addr().unwrap());
-                return;
+        match update {
+            ClientUpdate::NewUser(user) => {
+                messaging_service.send(Update::NewUser(UserInternal{ name: user.name, connection: conn_addr })).unwrap();
+
+                user_created = true;
             }
-            Ok(_) => {
-                if let Ok(data) = std::str::from_utf8(&data) {
-                    println!("{}", data);
-                } else {
-                    println!("Could not read incoming data to utf8");
-                    continue;
-                }
 
-                //
-                // broadcast message to other connections
-                //
+            ClientUpdate::NewMessage(new_message) => {
+                if !user_created { continue }
 
-                broadcast_sender.send(std::str::from_utf8(&data).unwrap().to_string()).unwrap();
+                messaging_service.
+                    send(Update::NewMessage(NewMessage{
+                        from: "".into(), 
+                        connection: conn_addr.clone(),
+                        message: new_message.message,
+                    })).unwrap();
+            }
 
-                data.fill(0);
-            },
-
-            Err(err) => match err.kind() {
-                    ErrorKind::ConnectionReset |
-                    ErrorKind::ConnectionAborted |
-                    ErrorKind::BrokenPipe  => {
-                        println!("Client {} disconnected", conn.peer_addr().unwrap());
-                        return;
-                }
-
-                    _ => {
-                        eprintln!("Could not receive from client due to: {}\nClosing Connection", err);
-                        conn.shutdown(std::net::Shutdown::Both).unwrap();
-                }
+           ClientUpdate::Disconnected(addr) => {
+                _ = conn.shutdown(std::net::Shutdown::Both);
+                let Err(err) = messaging_service.send(Update::Disconnected(addr)) else { continue };
+                println!("ERROR: {}", err);
+                return;
             }
         }
     }
 }
 
-fn listen_and_serve_connections(server: TcpListener, messaging_service: Arc<Mutex<MessagingService>>) {
+fn listen_and_serve_connections(
+    server: TcpListener,
+    messaging_service: Arc<Mutex<MessagingService>>,
+) {
     std::thread::spawn(move || {
         loop {
             if let Ok((conn, conn_addr)) = server.accept() {
                 let mut messaging_service_lock = messaging_service.lock().unwrap();
-                messaging_service_lock.add_connection(conn.try_clone().unwrap());
+                let connection_clone = conn.try_clone().unwrap();
+                messaging_service_lock.add_connection(connection_clone);
                 let messaging_service_sender = messaging_service_lock.get_sender();
-
 
                 _ = std::thread::spawn(move || {
                     handle(conn, conn_addr, messaging_service_sender);
                 });
-
             }
         }
     });
@@ -140,17 +258,20 @@ fn listen_and_serve_connections(server: TcpListener, messaging_service: Arc<Mute
 
 fn broadcast_message_to_connections(
     user_input_receiver: Arc<Mutex<Receiver<String>>>,
-    sender:             Sender<String>,
+    sender: Sender<Update>,
 ) {
-
-    std::thread::spawn( move || {
+    std::thread::spawn(move || {
         loop {
             if let Ok(data) = user_input_receiver.lock().unwrap().recv() {
-                sender.send(data).unwrap();
+                sender.send(Update::ServerBroadcast(
+                        ServerBroadcast{
+                            from: "[SERVER]".into(),
+                            message: data,
+                        }
+                )).unwrap();
             }
         }
-    }
-    );
+    });
 }
 
 fn server() {
@@ -170,7 +291,10 @@ fn server() {
     let messaging_service_connections = Arc::clone(&messaging_service_mut);
     listen_and_serve_connections(server, messaging_service_connections);
 
-    broadcast_message_to_connections(Arc::new(Mutex::new(user_input_receiver)), messaging_service_sender);
+    broadcast_message_to_connections(
+        Arc::new(Mutex::new(user_input_receiver)),
+        messaging_service_sender,
+    );
 
     loop {
         let user_input = get_user_input();
@@ -181,4 +305,3 @@ fn server() {
 fn main() {
     server();
 }
-
