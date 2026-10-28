@@ -196,7 +196,7 @@ fn get_user_input() -> String {
 
 
 fn handle(conn: TcpStream, conn_addr: std::net::SocketAddr, messaging_service: Sender<Update>) {
-    println!("Connection accepted from: {}", conn_addr.ip().to_string());
+    //println!("Connection accepted from: {}", conn_addr.ip().to_string());
 
     let mut user_created = false;
     
